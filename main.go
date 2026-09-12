@@ -91,6 +91,13 @@ func shortenHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	transaction, err := pool.Begin(ctx)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "DB issue"})
+		return
+	}
+	defer transaction.Rollback(ctx)
 	sql := "INSERT INTO links (long_url) VALUES ($1) RETURNING id"
 	var id int64
 
@@ -99,15 +106,21 @@ func shortenHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "Empty JSON brother"})
 		return
 	}
-	if err := pool.QueryRow(ctx, sql, link.URL).Scan(&id); err != nil {
+	if err := transaction.QueryRow(ctx, sql, link.URL).Scan(&id); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Link addition failed"})
 		return
 	}
 	encoded_id := encode.Encode(id)
-	if _, err := pool.Exec(ctx, "UPDATE links SET code = $1 WHERE id = $2", encoded_id, id); err != nil {
+	if _, err := transaction.Exec(ctx, "UPDATE links SET code = $1 WHERE id = $2", encoded_id, id); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Link update failed"})
+		return
+	}
+
+	if err := transaction.Commit(ctx); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "DB commit failed"})
 		return
 	}
 
