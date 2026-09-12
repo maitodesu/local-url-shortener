@@ -1,0 +1,11 @@
+# secrets - never commit real credential files (the .example templates are fine)
+secrets.*.env
+
+# build artifacts
+*.exe
+
+# scratch/local-only files
+scratchpad/
+
+# internal plan with real infra details - not for the public repo
+docs/PLAN.internal.md
