@@ -210,6 +210,12 @@ func shortenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.TrimSpace(link.URL) == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Empty JSON brother"})
+		return
+	}
+
 	ctx := r.Context()
 	transaction, err := pool.Begin(ctx)
 	if err != nil {
@@ -218,15 +224,33 @@ func shortenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer transaction.Rollback(ctx)
-	sql := "INSERT INTO links (long_url) VALUES ($1) RETURNING id"
-	var id int64
 
-	if strings.TrimSpace(link.URL) == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Empty JSON brother"})
+	// ON CONFLICT DO NOTHING relies on the unique index on long_url: a
+	// concurrent request for the same URL blocks on that index's row lock
+	// until the first transaction commits, so this can't race like a
+	// separate SELECT-then-INSERT check would.
+	sql := "INSERT INTO links (long_url) VALUES ($1) ON CONFLICT (long_url) DO NOTHING RETURNING id"
+	var id int64
+	err = transaction.QueryRow(ctx, sql, link.URL).Scan(&id)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		var existingCode string
+		selectSQL := "SELECT code FROM links WHERE long_url = $1"
+		if err := transaction.QueryRow(ctx, selectSQL, link.URL).Scan(&existingCode); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Link lookup failed"})
+			return
+		}
+		if err := transaction.Commit(ctx); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "DB commit failed"})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"code": existingCode})
 		return
 	}
-	if err := transaction.QueryRow(ctx, sql, link.URL).Scan(&id); err != nil {
+	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Link addition failed"})
 		return
