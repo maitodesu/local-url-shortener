@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"prod-url-shortener/encode"
 	"strings"
@@ -62,7 +64,7 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // via a fixed bucket based approach using LUA in redis
 func rateLimitChecker(r *http.Request) bool {
 	ip := getClientIP(r)
-	cmd := rdb.Eval(r.Context(), string(luaScript), []string{ip}, maxTokens, refillRate, time.Now().Unix())
+	cmd := rdb.Eval(r.Context(), string(luaScript), []string{fmt.Sprintf("ratelimit:%s", ip)}, maxTokens, refillRate, time.Now().Unix())
 	result, err := cmd.Int64()
 	if err != nil {
 		// Handle Redis error (e.g., redis connection lost or script compilation failure)
@@ -95,44 +97,108 @@ func pingHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// resolveLongURL looks up a code's destination via cache-aside: Redis first,
+// Postgres on a miss, populating the cache before returning. Shared by
+// codeHandler (redirect) and previewHandler (needs the same destination to
+// hand to the preview API), so both stay in sync with one lookup path.
+func resolveLongURL(ctx context.Context, code string) (string, error) {
+	longURL, err := rdb.Get(ctx, fmt.Sprintf("url:%s", code)).Result()
+	if err == nil {
+		return longURL, nil
+	}
+	if !errors.Is(err, redis.Nil) {
+		log.Print("Redis is not working, check please")
+	}
+
+	sql := "SELECT long_url FROM links WHERE code = $1"
+	if err := pool.QueryRow(ctx, sql, code).Scan(&longURL); err != nil {
+		return "", err
+	}
+	rdb.Set(ctx, fmt.Sprintf("url:%s", code), longURL, 0)
+	return longURL, nil
+}
+
 func codeHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	code := r.PathValue("code")
-	var longURL string
-	var err error
-	var sql string
-	longURL, err = rdb.Get(r.Context(), code).Result()
+
+	longURL, err := resolveLongURL(r.Context(), code)
 	if err != nil {
-		// if it's behaving bad, we log and still continue as DB might working, we don't want to stop the functionality
-		if !errors.Is(err, redis.Nil) {
-			log.Print("Redis is not working, check please")
-
-		}
-		// if not found we still continue to DB
-
-		sql = "SELECT long_url FROM LINKS WHERE code = $1"
-		if err := pool.QueryRow(r.Context(), sql, code).Scan(&longURL); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				w.WriteHeader(http.StatusNotFound)
-				json.NewEncoder(w).Encode(map[string]string{"error": "Link not found"})
-				return
-			}
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Fetching failed"})
+		if errors.Is(err, pgx.ErrNoRows) {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Link not found"})
 			return
 		}
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Fetching failed"})
+		return
 	}
-	sql = "UPDATE links SET hit_count = hit_count + 1 WHERE code = $1"
+
+	sql := "UPDATE links SET hit_count = hit_count + 1 WHERE code = $1"
 	// make this non fatal, we take this in our design that it's okay to have this hit count non consistent because of db failures, but user should go to their respective URL
 	if _, err := pool.Exec(r.Context(), sql, code); err != nil {
 		log.Print("Couldn't update the hit count for ", longURL)
 	}
 
-	if errors.Is(err, redis.Nil) {
-		rdb.Set(r.Context(), code, longURL, 0)
+	http.Redirect(w, r, longURL, http.StatusFound)
+}
+
+// previewHandler returns Open Graph-style preview data (title, description,
+// image) for a short code's destination, cache-aside via Redis with the
+// LinkPreview.net/Exabase API as the origin on a miss. Deliberately never
+// touches Postgres for the preview data itself -- that's third-party-derived
+// and ephemeral, unlike the long URL, which is canonical app data.
+func previewHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	code := r.PathValue("code")
+
+	previewKey := fmt.Sprintf("preview:%s", code)
+	if cached, err := rdb.Get(r.Context(), previewKey).Result(); err == nil {
+		w.Write([]byte(cached))
+		return
+	} else if !errors.Is(err, redis.Nil) {
+		log.Print("Redis is not working, check please")
 	}
 
-	http.Redirect(w, r, longURL, http.StatusFound)
+	longURL, err := resolveLongURL(r.Context(), code)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Link not found"})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Fetching failed"})
+		return
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	apiURL := fmt.Sprintf("https://api.exabase.io/v2/link?url=%s", url.QueryEscape(longURL))
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, apiURL, nil)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Preview request failed"})
+		return
+	}
+	req.Header.Set("X-Api-Key", os.Getenv("LINKPREVIEW_API_KEY"))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Couldn't reach preview service"})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Preview service error"})
+		return
+	}
+
+	rdb.Set(r.Context(), previewKey, body, 24*time.Hour)
+	w.Write(body)
 }
 
 func shortenHandler(w http.ResponseWriter, r *http.Request) {
@@ -185,6 +251,7 @@ func shortenHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	http.HandleFunc("POST /short", rateLimitMiddleware(shortenHandler))
 	http.HandleFunc("GET /{code}", codeHandler)
+	http.HandleFunc("GET /{code}/preview", previewHandler)
 	http.HandleFunc("GET /ping", pingHandler)
 	ctx := context.Background()
 	var err error
