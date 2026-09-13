@@ -206,6 +206,29 @@ func previewHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
+const maxLongURLLength = 1024
+
+// isValidLongURL reports whether raw is a URL we're willing to shorten: a
+// parseable absolute http(s) URL with a host that looks like a real domain
+// (contains a dot), under a sane length. url.Parse alone isn't enough --
+// it happily "parses" garbage like "asdf" into a URL with everything empty.
+func isValidLongURL(raw string) bool {
+	if raw == "" || len(raw) > maxLongURLLength {
+		return false
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+
+	return strings.Contains(parsed.Host, ".")
+}
+
 func shortenHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	var link UserLink
@@ -215,9 +238,10 @@ func shortenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.TrimSpace(link.URL) == "" {
+	longURL := strings.TrimSpace(link.URL)
+	if !isValidLongURL(longURL) {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Empty JSON brother"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid or empty URL"})
 		return
 	}
 
@@ -236,12 +260,12 @@ func shortenHandler(w http.ResponseWriter, r *http.Request) {
 	// separate SELECT-then-INSERT check would.
 	sql := "INSERT INTO links (long_url) VALUES ($1) ON CONFLICT (long_url) DO NOTHING RETURNING id"
 	var id int64
-	err = transaction.QueryRow(ctx, sql, link.URL).Scan(&id)
+	err = transaction.QueryRow(ctx, sql, longURL).Scan(&id)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		var existingCode string
 		selectSQL := "SELECT code FROM links WHERE long_url = $1"
-		if err := transaction.QueryRow(ctx, selectSQL, link.URL).Scan(&existingCode); err != nil {
+		if err := transaction.QueryRow(ctx, selectSQL, longURL).Scan(&existingCode); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": "Link lookup failed"})
 			return
