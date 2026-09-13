@@ -27,6 +27,17 @@ const maxTokens int8 = 60
 const refillRate float32 = 0.06 // tokens per second (~1 token every 16.7s)
 
 func getClientIP(r *http.Request) string {
+	// Only trust X-Forwarded-For when explicitly told we're behind our own
+	// reverse proxy (which overwrites this header with the real client IP,
+	// rather than trusting whatever a client sent). Without this flag, a
+	// directly-reachable instance would let any client spoof its IP via
+	// this same header, so it defaults off.
+	if os.Getenv("TRUST_PROXY_HEADERS") == "true" {
+		if xForwardedFor := r.Header.Get("X-Forwarded-For"); xForwardedFor != "" {
+			return strings.TrimSpace(xForwardedFor)
+		}
+	}
+
 	// RemoteAddr (strip the port number)
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
