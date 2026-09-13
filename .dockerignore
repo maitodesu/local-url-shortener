@@ -1,0 +1,5 @@
+secrets.*.env
+scratchpad/
+docs/PLAN.internal.md
+.git/
+*.exe
