@@ -6,18 +6,61 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"prod-url-shortener/encode"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
-var pool *pgxpool.Pool = nil
-var rdb *redis.Client = nil
+var pool *pgxpool.Pool
+var rdb *redis.Client
+
+var luaScript []byte
+
+const maxTokens int8 = 60
+const refillRate float32 = 0.06 // tokens per second (~1 token every 16.7s)
+
+func getClientIP(r *http.Request) string {
+	// RemoteAddr (strip the port number)
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr // Fallback if splitting fails
+	}
+	return ip
+}
+
+func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		proceed := rateLimitChecker(r)
+		if proceed {
+			next(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]string{"error": "yamete kudasai"})
+	}
+}
+
+// Return a bool whether a request is allowed for a ip or not,
+// via a fixed bucket based approach using LUA in redis
+func rateLimitChecker(r *http.Request) bool {
+	ip := getClientIP(r)
+	cmd := rdb.Eval(r.Context(), string(luaScript), []string{ip}, maxTokens, refillRate, time.Now().Unix())
+	result, err := cmd.Int64()
+	if err != nil {
+		// Handle Redis error (e.g., redis connection lost or script compilation failure)
+		log.Printf("Redis error: %v", err)
+		return false
+	}
+
+	return result == 1
+}
 
 func databaseURL() string {
 	var user = os.Getenv("POSTGRES_USER")
@@ -129,11 +172,15 @@ func shortenHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	http.HandleFunc("POST /short", shortenHandler)
+	http.HandleFunc("POST /short", rateLimitMiddleware(shortenHandler))
 	http.HandleFunc("GET /{code}", codeHandler)
 	http.HandleFunc("GET /ping", pingHandler)
 	ctx := context.Background()
 	var err error
+	luaScript, err = os.ReadFile("token-script.lua")
+	if err != nil {
+		log.Fatal("Couldn't load lua script, rate limiter broke")
+	}
 	pool, err = pgxpool.New(ctx, databaseURL())
 	if err != nil {
 		log.Fatal("Error connecting to DB", err)
