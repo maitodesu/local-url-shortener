@@ -197,7 +197,12 @@ func previewHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rdb.Set(r.Context(), previewKey, body, 7*24*time.Hour)
+	// No TTL: memory isn't the constraint here (see commit history for the
+	// math), and this is third-party-derived page metadata that doesn't
+	// change often enough to justify paying for a re-fetch on a timer.
+	// Redis's own allkeys-lru + maxmemory already bounds real memory
+	// pressure if it ever came to that.
+	rdb.Set(r.Context(), previewKey, body, 0)
 	w.Write(body)
 }
 
