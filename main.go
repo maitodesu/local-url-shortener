@@ -197,7 +197,7 @@ func previewHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rdb.Set(r.Context(), previewKey, body, 24*time.Hour)
+	rdb.Set(r.Context(), previewKey, body, 7*24*time.Hour)
 	w.Write(body)
 }
 
