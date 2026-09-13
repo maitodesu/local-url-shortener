@@ -37,4 +37,4 @@ See [`docs/PLAN.md`](docs/PLAN.md) for the design decisions made (base62 vs. has
 
 ## Status
 
-Core vertical slice complete. Not yet built: per-IP rate limiting on `/short`.
+Core vertical slice complete, plus a Redis-backed per-IP token bucket rate limiter on `POST /short` (atomic via a Lua `EVAL` script — see `token-script.lua`).
