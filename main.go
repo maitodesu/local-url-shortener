@@ -172,29 +172,40 @@ func previewHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	apiURL := fmt.Sprintf("https://api.exabase.io/v2/link?url=%s", url.QueryEscape(longURL))
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, apiURL, nil)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Preview request failed"})
-		return
-	}
-	req.Header.Set("X-Api-Key", os.Getenv("LINKPREVIEW_API_KEY"))
+	var body []byte
+	if os.Getenv("MOCK_PREVIEW_API") == "true" {
+		// Staging/load-testing only: skips the real third-party call (and its
+		// shared quota) while still exercising the same cache-aside write/read
+		// path below. Never set in production.
+		body = []byte(fmt.Sprintf(
+			`{"url":%q,"title":"Mock Preview","type":"link","description":"Synthetic preview data generated for load testing, not a real fetch.","siteName":"Mock","image":null,"favicon":null,"metadata":{}}`,
+			longURL,
+		))
+	} else {
+		client := &http.Client{Timeout: 5 * time.Second}
+		apiURL := fmt.Sprintf("https://api.exabase.io/v2/link?url=%s", url.QueryEscape(longURL))
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, apiURL, nil)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Preview request failed"})
+			return
+		}
+		req.Header.Set("X-Api-Key", os.Getenv("LINKPREVIEW_API_KEY"))
 
-	resp, err := client.Do(req)
-	if err != nil {
-		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Couldn't reach preview service"})
-		return
-	}
-	defer resp.Body.Close()
+		resp, err := client.Do(req)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Couldn't reach preview service"})
+			return
+		}
+		defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Preview service error"})
-		return
+		body, err = io.ReadAll(resp.Body)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Preview service error"})
+			return
+		}
 	}
 
 	// No TTL: memory isn't the constraint here (see commit history for the
